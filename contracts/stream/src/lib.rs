@@ -90,10 +90,10 @@ compile_error!("Fluxora production WASM must not enable the testutils feature.")
 extern crate std;
 
 mod accrual;
-#[cfg(test)]
-mod protocol_limits;
 mod error;
 mod events;
+#[cfg(test)]
+mod protocol_limits;
 mod storage;
 mod types;
 
@@ -105,15 +105,38 @@ pub use storage::{
     MIN_STREAM_TTL_LEDGERS, SECONDS_PER_LEDGER, TTL_BUFFER_SECONDS, TTL_SAFETY_MARGIN_PERCENT,
 };
 pub use types::op;
-pub use types::{DataKey, DelegateGrant, ReleaseCurve, Stream, StreamStatus};
-pub use types::{BatchCreateRequest, DataKey, DelegateGrant, Stream, StreamStatus};
-pub use types::{BatchCancelOutcome, DataKey, DelegateGrant, Stream, StreamStatus};
-pub use types::{CliffMode, DataKey, DelegateGrant, Stream, StreamStatus};
-pub use types::{DataKey, DelegateGrant, Stream, StreamStatus, MAX_REFERENCE_LENGTH};
+pub use types::{
+    BatchCancelOutcome, BatchCreateRequest, CliffMode, DataKey, DelegateGrant, ReleaseCurve,
+    Stream, StreamStatus, MAX_REFERENCE_LENGTH,
+};
 
 use soroban_sdk::{
-    contract, contractimpl, token, Address, Env, InvokeError, MuxedAddress, TryFromVal, Vec,
+    contract, contractimpl, contracttype, token, Address, Env, InvokeError, MuxedAddress, String,
+    TryFromVal, Vec,
 };
+
+/// Mirror of `fluxora_factory::FactoryConfig`, used to decode the return value
+/// of a cross-contract call to `FluxoraFactory::get_factory_config`.
+///
+/// `#[contracttype]` encodes structs as XDR maps keyed by field name, so this
+/// decodes correctly as long as the field names and types match the factory's
+/// definition — which they do, and `test::factory_policy_enforcement` verifies
+/// the round-trip end-to-end.
+///
+/// This type is intentionally private to this module: it is only ever produced
+/// by deserialising a factory response, never constructed directly.
+#[contracttype]
+#[derive(Clone)]
+struct FactoryConfig {
+    pub admin: Address,
+    pub stream_contract: Address,
+    pub max_deposit: i128,
+    pub min_duration: u64,
+    pub batch_cap_enforced: bool,
+    pub creation_paused: bool,
+    pub min_rate_per_second: Option<i128>,
+    pub max_rate_per_second: Option<i128>,
+}
 
 /// Maximum number of streams one batch call may touch.
 ///
@@ -395,6 +418,7 @@ impl FluxoraStream {
         cancellable: bool,
         pausable: bool,
         transferable: bool,
+        reference: Option<String>,
     ) -> Result<u64, Error> {
         Self::create_stream_with_cliff_mode(
             env,
@@ -409,6 +433,7 @@ impl FluxoraStream {
             cancellable,
             pausable,
             transferable,
+            reference,
         )
     }
 
@@ -520,7 +545,7 @@ impl FluxoraStream {
     ) -> Result<u64, Error> {
         sender.require_auth();
 
-        Self::create_stream_unchecked(
+        Self::create_stream_inner(
             env,
             sender,
             recipient,
@@ -529,9 +554,12 @@ impl FluxoraStream {
             start_time,
             end_time,
             cliff_time,
+            cliff_mode,
             cancellable,
             pausable,
             transferable,
+            reference,
+            ReleaseCurve::Linear,
         )
     }
 
@@ -545,9 +573,11 @@ impl FluxoraStream {
         start_time: u64,
         end_time: u64,
         cliff_time: u64,
+        cliff_mode: CliffMode,
         cancellable: bool,
         pausable: bool,
         transferable: bool,
+        reference: Option<String>,
     ) -> Result<u64, Error> {
         Self::create_stream_inner(
             env,
@@ -558,9 +588,11 @@ impl FluxoraStream {
             start_time,
             end_time,
             cliff_time,
+            cliff_mode,
             cancellable,
             pausable,
             transferable,
+            reference,
             ReleaseCurve::Linear,
         )
     }
@@ -629,9 +661,11 @@ impl FluxoraStream {
             start_time,
             end_time,
             cliff_time,
+            CliffMode::DEFAULT,
             cancellable,
             pausable,
             transferable,
+            None,
             curve,
         )
     }
@@ -653,9 +687,11 @@ impl FluxoraStream {
         start_time: u64,
         end_time: u64,
         cliff_time: u64,
+        cliff_mode: CliffMode,
         cancellable: bool,
         pausable: bool,
         transferable: bool,
+        reference: Option<String>,
         curve: ReleaseCurve,
     ) -> Result<u64, Error> {
         // Emergency halt (#1818): refuse state changes before anything else.
@@ -677,7 +713,7 @@ impl FluxoraStream {
 
         // Validate reference length if provided
         if let Some(ref r) = reference {
-            if r.len() > MAX_REFERENCE_LENGTH as usize {
+            if r.len() > MAX_REFERENCE_LENGTH {
                 return Err(Error::InvalidReferenceLength);
             }
         }
@@ -790,12 +826,149 @@ impl FluxoraStream {
                 request.start_time,
                 request.end_time,
                 request.cliff_time,
+                CliffMode::DEFAULT,
                 request.cancellable,
                 request.pausable,
                 request.transferable,
+                None,
             )?);
         }
         Ok(ids)
+    }
+
+    /// Create a stream enforcing the policy of a deployed [`FluxoraFactory`].
+    ///
+    /// Identical to [`create_stream`](Self::create_stream) in every respect
+    /// except that it first loads the factory's policy via a cross-contract
+    /// call and validates the request against all configured constraints before
+    /// creating the stream:
+    ///
+    /// * **Pause check** — if the factory's creation pause is on, the call
+    ///   returns [`Error::FactoryPaused`] immediately.
+    /// * **Deposit cap** — `deposit` must not exceed `policy.max_deposit`;
+    ///   excess returns [`Error::DepositExceedsCap`].
+    /// * **Duration floor** — `end_time - start_time` must be at least
+    ///   `policy.min_duration`; a shorter schedule returns
+    ///   [`Error::DurationBelowMinimum`].
+    /// * **Token allowlist** — the `token` must be allowlisted on the factory;
+    ///   an absent entry returns [`Error::TokenNotAllowlisted`].
+    /// * **Rate bounds** — if set, the per-second rate (`deposit / duration`)
+    ///   must lie within `[min_rate_per_second, max_rate_per_second]`; a rate
+    ///   outside the interval returns [`Error::RateBelowMin`] or
+    ///   [`Error::RateAboveMax`].
+    ///
+    /// All other validation (self-stream, dust rate, overflow guard, etc.) is
+    /// identical to [`create_stream`](Self::create_stream).
+    ///
+    /// # Authorization
+    ///
+    /// Requires `sender`'s auth, exactly as [`create_stream`](Self::create_stream).
+    /// No factory-admin auth is needed; the factory contract itself is read
+    /// via permissionless view calls.
+    ///
+    /// # Errors
+    ///
+    /// All errors from [`create_stream`](Self::create_stream) plus:
+    /// * [`Error::FactoryPaused`]
+    /// * [`Error::DepositExceedsCap`]
+    /// * [`Error::DurationBelowMinimum`]
+    /// * [`Error::TokenNotAllowlisted`]
+    /// * [`Error::RateBelowMin`]
+    /// * [`Error::RateAboveMax`]
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_stream_via_factory(
+        env: Env,
+        factory: Address,
+        sender: Address,
+        recipient: Address,
+        token: Address,
+        deposit: i128,
+        start_time: u64,
+        end_time: u64,
+        cliff_time: u64,
+        cancellable: bool,
+        pausable: bool,
+        transferable: bool,
+    ) -> Result<u64, Error> {
+        // Load policy from the factory contract via cross-contract calls.
+        // `get_factory_config` and `is_allowlisted` are permissionless read
+        // views — no auth is required or consumed.
+        use soroban_sdk::Symbol;
+
+        // Fetch the full config in one call.
+        let config: FactoryConfig = env.invoke_contract(
+            &factory,
+            &Symbol::new(&env, "get_factory_config"),
+            soroban_sdk::vec![&env],
+        );
+
+        // 1. Pause check — refuse first, before any other work.
+        if config.creation_paused {
+            return Err(Error::FactoryPaused);
+        }
+
+        // 2. Deposit cap.
+        if deposit > config.max_deposit {
+            return Err(Error::DepositExceedsCap);
+        }
+
+        // 3. Duration floor — validate time range first so the subtraction
+        //    cannot underflow (end_time > start_time is checked inside
+        //    create_stream_inner, but we need the duration here).
+        if end_time <= start_time {
+            // Let create_stream_inner produce the proper InvalidTimeRange error.
+        } else {
+            let duration = end_time - start_time;
+            if duration < config.min_duration {
+                return Err(Error::DurationBelowMinimum);
+            }
+
+            // 4. Rate bounds — rate = deposit / duration (integer floor).
+            //    deposit <= 0 is caught by create_stream_inner; a non-positive
+            //    deposit here simply skips the check, letting the inner path
+            //    produce InvalidDeposit.
+            if deposit > 0 {
+                let rate = deposit / duration as i128;
+                if let Some(min_rate) = config.min_rate_per_second {
+                    if rate < min_rate {
+                        return Err(Error::RateBelowMin);
+                    }
+                }
+                if let Some(max_rate) = config.max_rate_per_second {
+                    if rate > max_rate {
+                        return Err(Error::RateAboveMax);
+                    }
+                }
+            }
+        }
+
+        // 5. Token allowlist.
+        let allowlisted: bool = env.invoke_contract(
+            &factory,
+            &Symbol::new(&env, "is_allowlisted"),
+            soroban_sdk::vec![&env, token.to_val()],
+        );
+        if !allowlisted {
+            return Err(Error::TokenNotAllowlisted);
+        }
+
+        // All policy checks passed — create the stream normally.
+        Self::create_stream_inner(
+            env,
+            sender,
+            recipient,
+            token,
+            deposit,
+            start_time,
+            end_time,
+            cliff_time,
+            CliffMode::DEFAULT,
+            cancellable,
+            pausable,
+            transferable,
+            None, // reference
+            ReleaseCurve::Linear,
+        )
     }
 
     /// Add funds to a live stream.

@@ -86,6 +86,12 @@ pip install pytest pytest-cov
 pytest tests/ --cov=script/ --cov-fail-under=50 -v --tb=short
 python3 script/validate-doc-alignment.py
 python3 script/verify_soroban_version.py
+
+# Event snapshot coverage gate (issue #1701): every #[contractevent] struct
+# must have a fixture under tests/fixtures/event_snapshots/events/. After an
+# intentional event change, regenerate and commit with:
+#   python3 script/check_event_snapshots.py --update
+python3 script/check_event_snapshots.py
 ```
 
 The Soroban SDK target is authoritative in `Cargo.toml` under
